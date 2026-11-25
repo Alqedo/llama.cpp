@@ -804,8 +804,17 @@ static bool ggml_metal_fusion_check_mul_mat_add(
     const ggml_tensor * res = ggml_metal_mul_mat_add_residual(mm, add);
 
     if (res == nullptr ||
-        ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
-        (!ggml_metal_op_mul_mat_use_mma(mm) && !ggml_metal_op_mul_mat_use_mm(mm, true))) {
+        ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+
+    const bool use_mm_aligned =
+        mm->ne[0] % 4 == 0 &&
+        res->view_offs % 16 == 0 &&
+        add->view_offs % 16 == 0 &&
+        ggml_metal_op_mul_mat_use_mm(mm, true);
+
+    if (!ggml_metal_op_mul_mat_use_mma(mm) && !use_mm_aligned) {
         return false;
     }
 
