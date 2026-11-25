@@ -1,12 +1,13 @@
 #include "common.h"
 #include "dequantize.h"
 
-constant bool FC_mul_mm_bc_inp [[function_constant(FC_MUL_MM + 0)]];
-constant bool FC_mul_mm_bc_out [[function_constant(FC_MUL_MM + 1)]];
-constant short FC_mul_mm_ne12  [[function_constant(FC_MUL_MM + 2)]];
-constant short FC_mul_mm_ne13  [[function_constant(FC_MUL_MM + 3)]];
-constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
-constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
+constant bool FC_mul_mm_bc_inp    [[function_constant(FC_MUL_MM + 0)]];
+constant bool FC_mul_mm_bc_out    [[function_constant(FC_MUL_MM + 1)]];
+constant short FC_mul_mm_ne12     [[function_constant(FC_MUL_MM + 2)]];
+constant short FC_mul_mm_ne13     [[function_constant(FC_MUL_MM + 3)]];
+constant short FC_mul_mm_r2       [[function_constant(FC_MUL_MM + 4)]];
+constant short FC_mul_mm_r3       [[function_constant(FC_MUL_MM + 5)]];
+constant bool FC_mul_mm_fuse_add  [[function_constant(FC_MUL_MM + 6)]];
 constant int32_t FC_mul_mm_id_map0_ne02 [[function_constant(FC_MUL_MM + 7)]];
 
 // each block_q contains 16*nl weights
@@ -21,11 +22,14 @@ kernel void kernel_mul_mm(
         device const char * srcA,
         device const char * srcB,
         device       char * dst,
+        device const char * res,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiitg [[thread_index_in_threadgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     (void) sgitg;
+    (void) res;
+    (void) FC_mul_mm_fuse_add;
 
     // Matrix dimensions: A(M,K) x B(K,N) -> C(M,N)
     const int K = args.ne00;
@@ -157,6 +161,7 @@ kernel void kernel_mul_mm(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        device const char * res,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -209,8 +214,19 @@ kernel void kernel_mul_mm(
 
     simdgroup_float8x8 mc[8];
 
-    for (short i = 0; i < 8; i++){
-        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    const bool full_tile = !FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1);
+    if (FC_mul_mm_fuse_add && full_tile) {
+        device const float * R = (device const float *) res +
+            (r0 + 32*(sgitg &  1)) +
+            (uint64_t) (r1 + 16*(sgitg >> 1))*args.ne0 + (uint64_t) im*args.ne1*args.ne0;
+
+        for (short i = 0; i < 8; i++) {
+            simdgroup_load(mc[i], R + 8*(i%4) + (uint64_t) 8*args.ne0*(i/4), args.ne0, 0, false);
+        }
+    } else {
+        for (short i = 0; i < 8; i++){
+            mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+        }
     }
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
@@ -296,6 +312,10 @@ kernel void kernel_mul_mm(
         threadgroup const S1 * lsmb = (sb + 2*64*(sgitg/2));
 
         FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+            if (FC_mul_mm_bc_inp && loop_k + ik*8 >= args.ne00) {
+                break;
+            }
+
             simdgroup_barrier(mem_flags::mem_none);
 
             FOR_UNROLL (short i = 0; i < 4; i++) {
@@ -319,7 +339,7 @@ kernel void kernel_mul_mm(
         }
     }
 
-    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
+    if (full_tile) {
         // if no bounds checks on the output are needed, we can directly write to device memory
         device float * C = (device float *) dst +
             (r0 + 32*(sgitg &  1)) + \
@@ -348,14 +368,29 @@ kernel void kernel_mul_mm(
                 threadgroup float  * C  = temp_str + (j*NR0);
                 threadgroup float4 * C4 = (threadgroup float4 *) C;
 
-                int i = 0;
-                for (; i < nr0/4; i++) {
-                    *(D4 + i) = *(C4 + i);
-                }
+                if (FC_mul_mm_fuse_add) {
+                    device const float  * R  = (device const float  *) res + r0 + (uint64_t) (r1 + j)*args.ne0 + (uint64_t) im*args.ne1*args.ne0;
+                    device const float4 * R4 = (device const float4 *) R;
 
-                i *= 4;
-                for (; i < nr0; i++) {
-                    *(D + i) = *(C + i);
+                    int i = 0;
+                    for (; i < nr0/4; i++) {
+                        *(D4 + i) = *(C4 + i) + *(R4 + i);
+                    }
+
+                    i *= 4;
+                    for (; i < nr0; i++) {
+                        *(D + i) = *(C + i) + *(R + i);
+                    }
+                } else {
+                    int i = 0;
+                    for (; i < nr0/4; i++) {
+                        *(D4 + i) = *(C4 + i);
+                    }
+
+                    i *= 4;
+                    for (; i < nr0; i++) {
+                        *(D + i) = *(C + i);
+                    }
                 }
             }
         }

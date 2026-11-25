@@ -32,13 +32,30 @@ bool ggml_metal_op_mul_mat_use_fwht(const struct ggml_tensor * op, size_t max_tg
            ggml_metal_fwht_supported_size(op->src[1]->ne[0], max_tg_mem);
 }
 
+static bool ggml_metal_mul_mm_small_k_type(enum ggml_type type) {
+    return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
+}
+
 bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne11 = op->src[1]->ne[1];
 
-    return !ggml_is_transposed(op->src[0]) &&
-           !ggml_is_transposed(op->src[1]) &&
-           has_simdgroup_mm && ne11 > 8 && ne00 >= 32;
+    if (ggml_is_transposed(op->src[0]) || ggml_is_transposed(op->src[1]) || !has_simdgroup_mm) {
+        return false;
+    }
+
+    if (ne00 >= 32 && ne11 > 8) {
+        return true;
+    }
+
+    // Small-K unquantized projections (e.g. LoRA-B with rank 8..31):
+    // mul_mm's bc_inp path reads src0/src1 element-wise without dequantization, avoiding the
+    // scalar nr1=1 mul_mv_short fallback and enabling fused MUL_MAT + ADD for batches >= 4.
+    return ggml_metal_mul_mm_small_k_type(op->src[0]->type) &&
+           op->src[1]->type == GGML_TYPE_F32 &&
+           op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+           op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) &&
+           ne00 >= 8 && ne00 < 32 && ne11 >= 4;
 }
 
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {

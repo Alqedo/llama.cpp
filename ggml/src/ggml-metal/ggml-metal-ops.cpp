@@ -2872,7 +2872,18 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //    default: break;
         //}
 
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op);
+        const int  n_fuse   = !props_dev->has_tensor ? ggml_metal_op_try_fusion(ctx, idx, GGML_METAL_FUSION_MUL_MAT_ADD) : 1;
+        const bool fuse_add = n_fuse > 1;
+
+        const ggml_tensor * dst = op;
+        const ggml_tensor * res = dst;
+
+        if (fuse_add) {
+            dst = ctx->node(idx + n_fuse - 1);
+            res = dst->src[0] == op ? dst->src[1] : dst->src[0];
+        }
+
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op, fuse_add);
 
         ggml_metal_kargs_mul_mm args = {
             /*.ne00 =*/ ne00,
@@ -2895,7 +2906,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),        3);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(res),        4);
 
         const size_t smem = pipeline.smem;
 
@@ -2906,6 +2918,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         const int nsg = pipeline.nsg;
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
+
+        return n_fuse;
     } else {
         return ggml_metal_op_mul_mat_mv(ctx, idx);
     }
