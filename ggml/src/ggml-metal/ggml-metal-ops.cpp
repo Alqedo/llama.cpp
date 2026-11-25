@@ -2130,31 +2130,11 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
-    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
-    const int K_snap = ggml_get_op_params_i32(op, 0);
-    const bool use_r8 =
-        props_dev->has_simdgroup_reduction &&
-        op->src[0]->type == GGML_TYPE_F32 &&
-        op->src[1]->type == GGML_TYPE_F32 &&
-        op->src[2]->type == GGML_TYPE_F32 &&
-        op->src[3]->type == GGML_TYPE_F32 &&
-        op->src[4]->type == GGML_TYPE_F32 &&
-        op->src[5]->type == GGML_TYPE_F32 &&
-        ne20 == 128 &&
-        op->src[3]->ne[0] == 1 &&
-        K_snap == 1 &&
-        ne22 >= 1 &&
-        nb00 == sizeof(float) &&
-        nb10 == sizeof(float) &&
-        nb20 == sizeof(float);
-
-    auto pipeline = use_r8
-        ? ggml_metal_library_get_pipeline_gated_delta_net_r8(lib, op)
-        : ggml_metal_library_get_pipeline_gated_delta_net(lib, op);
-
     // when fused with the trailing cache cpy, the snapshots are written straight into the
     // recurrent cache and the cpy is skipped (see GGML_METAL_FUSION_GDN_CACHE)
-    ggml_metal_buffer_id bid_out = ggml_metal_get_buffer_id(op);
+    const ggml_metal_buffer_id bid_src5 = ggml_metal_get_buffer_id(op->src[5]);
+    const ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+    ggml_metal_buffer_id bid_out = bid_dst;
     uint64_t nb_out = 0;
     int n_fuse = 1;
 
@@ -2176,6 +2156,33 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
             }
         }
     }
+
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+    const int K_snap = ggml_get_op_params_i32(op, 0);
+    const bool use_r8 =
+        props_dev->has_simdgroup_reduction &&
+        op->type == GGML_TYPE_F32 &&
+        op->src[0]->type == GGML_TYPE_F32 &&
+        op->src[1]->type == GGML_TYPE_F32 &&
+        op->src[2]->type == GGML_TYPE_F32 &&
+        op->src[3]->type == GGML_TYPE_F32 &&
+        op->src[4]->type == GGML_TYPE_F32 &&
+        op->src[5]->type == GGML_TYPE_F32 &&
+        ne00 == 128 &&
+        ne10 == 128 &&
+        ne20 == 128 &&
+        op->src[3]->ne[0] == 1 &&
+        K_snap == 1 &&
+        ne22 >= 1 &&
+        nb00 == sizeof(float) &&
+        nb10 == sizeof(float) &&
+        nb20 == sizeof(float) &&
+        bid_src5.offs % 16 == 0 &&
+        bid_out.offs % 16 == 0;
+
+    auto pipeline = use_r8
+        ? ggml_metal_library_get_pipeline_gated_delta_net_r8(lib, op)
+        : ggml_metal_library_get_pipeline_gated_delta_net(lib, op);
 
     int ida = 0;
 
@@ -2225,8 +2232,8 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), ida++); // v
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), ida++); // gate
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), ida++); // beta
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), ida++); // state
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst (attn)
+    ggml_metal_encoder_set_buffer  (enc, bid_src5,                             ida++); // state
+    ggml_metal_encoder_set_buffer  (enc, bid_dst,                              ida++); // dst (attn)
     ggml_metal_encoder_set_buffer  (enc, bid_out,                              ida++); // state_out
 
     const int nsg = pipeline.nsg;
