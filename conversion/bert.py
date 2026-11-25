@@ -24,7 +24,9 @@ class BertModel(TextModel):
         self.vocab_size = None
 
         if cls_out_labels := self.hparams.get("id2label"):
-            if len(cls_out_labels) == 2 and cls_out_labels[0] == "LABEL_0":
+            is_dummy_0 = cls_out_labels.get("0") == "LABEL_0" or cls_out_labels.get(0) == "LABEL_0"
+            is_dummy_1 = cls_out_labels.get("1") == "LABEL_1" or cls_out_labels.get(1) == "LABEL_1"
+            if len(cls_out_labels) == 2 and is_dummy_0 and is_dummy_1:
                 # Remove dummy labels added by AutoConfig
                 cls_out_labels = None
         self.cls_out_labels = cls_out_labels
@@ -35,7 +37,15 @@ class BertModel(TextModel):
         self._try_set_pooling_type()
 
         if self.cls_out_labels:
-            self.gguf_writer.add_classifier_output_labels([v for k, v in sorted(self.cls_out_labels.items())])
+            archs = self.hparams.get("architectures") or []
+            if any(str(arch).endswith("ForSequenceClassification") for arch in archs):
+                self.gguf_writer.add_pooling_type(gguf.PoolingType.RANK)
+            self.gguf_writer.add_classifier_output_labels([
+                v for _, v in sorted(
+                    self.cls_out_labels.items(),
+                    key=lambda kv: (0, int(kv[0])) if (str(kv[0]).isascii() and str(kv[0]).isdigit()) else (1, str(kv[0])),
+                )
+            ])
 
     def set_vocab(self):
         tokens, toktypes, tokpre = self.get_vocab_base()
@@ -620,6 +630,9 @@ class ModernBertModel(BertModel):
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
+        if self.find_hparam(["layer_norm_eps", "layer_norm_epsilon", "norm_epsilon"], optional=True) is None:
+            if (norm_eps := self.hparams.get("norm_eps")) is not None:
+                self.gguf_writer.add_layer_norm_eps(float(norm_eps))
         self.gguf_writer.add_sliding_window(self.hparams["local_attention"])
         if (sliding_window_pattern := self.hparams.get("global_attn_every_n_layers")) is not None:
             self.gguf_writer.add_sliding_window_pattern(sliding_window_pattern)
