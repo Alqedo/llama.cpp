@@ -160,6 +160,61 @@ kernel void kernel_ssm_conv_f32_f32_batched_4(
     x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
 }
 
+// Fused CONCAT (dim=0) + SSM_CONV (nc=4) + SILU.
+// One thread owns one channel c across a tile of t_block tokens so reads from transposed
+// qkv_mixed (stride nb11 == 4) and writes to dst (stride nb0 == 4) are 100% coalesced.
+kernel void kernel_ssm_conv_concat_f32_4(
+        constant ggml_metal_kargs_ssm_conv_concat & args,
+        device const  void * src0,
+        device const  void * src1,
+        device const  void * src2,
+        device       float * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+    const int64_t c = (int64_t) tgpig.x * ntg.x + tpitg.x;
+    if (c >= args.ne01) {
+        return;
+    }
+
+    const int64_t s       = tgpig.z;
+    const int64_t t_start = (int64_t) tgpig.y * args.t_block;
+    const int64_t t_end   = min(t_start + (int64_t) args.t_block, args.ne10);
+    if (t_start >= t_end) {
+        return;
+    }
+
+    device const float * w_ptr = (device const float *) ((device const char *) src2 + c * args.nb21);
+    const float4 cw = float4(w_ptr[0], w_ptr[1], w_ptr[2], w_ptr[3]);
+
+    device const float * st = (device const float *) ((device const char *) src0 + c * args.nb01 + s * args.nb02);
+    device const char * s1_base = (device const char *) src1 + s * args.nb12 + c * sizeof(float);
+    device       char * d_base  = (device       char *) dst  + s * args.nb2  + c * sizeof(float);
+
+    float v0, v1, v2;
+    if (t_start == 0) {
+        v0 = st[0];
+        v1 = st[1];
+        v2 = st[2];
+    } else {
+        const int64_t t0 = t_start - 3;
+        const int64_t t1 = t_start - 2;
+        const int64_t t2 = t_start - 1;
+        v0 = t0 < 0 ? st[3 + t0] : *(device const float *) (s1_base + t0 * args.nb10);
+        v1 = t1 < 0 ? st[3 + t1] : *(device const float *) (s1_base + t1 * args.nb10);
+        v2 = t2 < 0 ? st[3 + t2] : *(device const float *) (s1_base + t2 * args.nb10);
+    }
+
+    for (int64_t t = t_start; t < t_end; ++t) {
+        const float v3 = *(device const float *) (s1_base + t * args.nb10);
+        const float sumf = dot(float4(v0, v1, v2, v3), cw);
+        *(device float *) (d_base + t * args.nb1) = sumf / (1.0f + exp(-sumf));
+        v0 = v1;
+        v1 = v2;
+        v2 = v3;
+    }
+}
+
 // ref: ggml.c:ggml_compute_forward_ssm_scan_f32, Mamba-2 part
 // Optimized version: reduces redundant memory loads by having one thread load shared values
 // TAIL == false is the whole-sequence / decode path: token_offset folds away at compile time.

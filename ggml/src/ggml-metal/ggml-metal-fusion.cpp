@@ -187,6 +187,74 @@ static bool ggml_metal_fusion_check_ssm_conv_silu(
     return true;
 }
 
+// CONCAT (dim=0) + SSM_CONV (nc=4) + UNARY (silu)
+// Reads conv_states and transposed qkv_mixed directly with coalesced channel-major threads,
+// eliding both the large strided CONCAT buffer and the separate SSM_CONV write.
+static bool ggml_metal_fusion_check_concat_ssm_conv_silu(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * concat = nodes[0];
+    const ggml_tensor * conv   = nodes[1];
+    const ggml_tensor * un     = nodes[2];
+
+    if (concat->op != GGML_OP_CONCAT || conv->op != GGML_OP_SSM_CONV || un->op != GGML_OP_UNARY) {
+        return false;
+    }
+
+    const int32_t dim = ((const int32_t *) concat->op_params)[0];
+    if (dim != 0 || conv->src[0] != concat || !conv->src[1] || un->src[0] != conv || un->src[1]) {
+        return false;
+    }
+
+    if (ggml_get_unary_op(un) != GGML_UNARY_OP_SILU) {
+        return false;
+    }
+
+    const ggml_tensor * s0 = concat->src[0];
+    const ggml_tensor * s1 = concat->src[1];
+    const ggml_tensor * w  = conv->src[1];
+    if (!s0 || !s1 || !w) {
+        return false;
+    }
+
+    if (s0->type != GGML_TYPE_F32 || s1->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+        concat->type != GGML_TYPE_F32 || conv->type != GGML_TYPE_F32 || un->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (w->ne[0] != 4 || w->ne[1] != s0->ne[1] || w->ne[2] != 1 || w->ne[3] != 1) {
+        return false;
+    }
+
+    if (s0->ne[0] != 3 || s0->ne[3] != 1 || s1->ne[0] <= 0 ||
+        s1->ne[1] != s0->ne[1] || s1->ne[2] != s0->ne[2] || s1->ne[3] != 1) {
+        return false;
+    }
+
+    if (conv->ne[0] != s0->ne[1] || conv->ne[1] != s1->ne[0] ||
+        conv->ne[2] != s0->ne[2] || conv->ne[3] != 1 || !ggml_are_same_shape(un, conv)) {
+        return false;
+    }
+
+    if (!ggml_is_contiguous(s0) || s1->nb[1] != sizeof(float) ||
+        !ggml_is_contiguous(w)  || un->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    int out_idx = node_idxs[idx + 2];
+    if (!ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 3, fusion->ops.data(), &out_idx, 1)) {
+        return false;
+    }
+
+    return true;
+}
+
 // ADD x N: each ADD reads the previous ADD as src0, and all addends must share layout
 // (and, in FULL mode, live in the same Metal buffer)
 static bool ggml_metal_fusion_check_add_chain(
@@ -841,7 +909,8 @@ static const std::vector<ggml_op> ops_snake = { GGML_OP_MUL, GGML_OP_SIN, GGML_O
 
 static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 
-static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
+static const std::vector<ggml_op> ops_ssm_conv_silu        = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
+static const std::vector<ggml_op> ops_concat_ssm_conv_silu = { GGML_OP_CONCAT, GGML_OP_SSM_CONV, GGML_OP_UNARY };
 
 static const std::vector<ggml_op> ops_moe_reduce_2 = {
     GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_ADD
@@ -919,7 +988,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE, ops_moe_reduce_7, {}, true, ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_MOE_REDUCE, ops_moe_reduce_8, {}, true, ggml_metal_fusion_check_moe_reduce },
 
-    { GGML_METAL_FUSION_SSM_CONV_SILU, ops_ssm_conv_silu, {}, false, ggml_metal_fusion_check_ssm_conv_silu },
+    { GGML_METAL_FUSION_SSM_CONV_SILU,        ops_ssm_conv_silu,        {}, false, ggml_metal_fusion_check_ssm_conv_silu },
+    { GGML_METAL_FUSION_CONCAT_SSM_CONV_SILU, ops_concat_ssm_conv_silu, {}, true, ggml_metal_fusion_check_concat_ssm_conv_silu },
 
     { GGML_METAL_FUSION_MUL_MAT_ADD, ops_mul_mat_add, {}, false, ggml_metal_fusion_check_mul_mat_add },
 };

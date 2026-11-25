@@ -961,6 +961,22 @@ typedef struct {
 } ggml_metal_kargs_ssm_conv;
 
 typedef struct {
+    int64_t  ne00;
+    int64_t  ne01;
+    int64_t  ne02;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    int64_t  ne10;
+    uint64_t nb10;
+    uint64_t nb12;
+    uint64_t nb21;
+    uint64_t nb1;
+    uint64_t nb2;
+    int32_t  t_block;
+} ggml_metal_kargs_ssm_conv_concat;
+
+typedef struct {
     int64_t  d_state;
     int64_t  d_inner;
     int64_t  n_head;

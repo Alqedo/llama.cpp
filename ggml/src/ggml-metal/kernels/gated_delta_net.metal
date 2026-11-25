@@ -151,6 +151,101 @@ template [[host_name("kernel_gated_delta_net_f32_1")]] kernel kernel_gated_delta
 template [[host_name("kernel_gated_delta_net_f32_2")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<2>;
 template [[host_name("kernel_gated_delta_net_f32_4")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<4>;
 
+// Zero-barrier 8-rows-per-simdgroup register kernel for S_v = 128, G = 1, K = 1:
+// Each simdgroup holds 8 contiguous rows of M (32 floats/thread in registers, 0 B threadgroup
+// memory, 0 threadgroup barriers), amortizing q/k loads and exp(g) 8x while overlapping 8
+// independent simd_sum reductions to hide ALU/reduction latency on Apple Silicon.
+kernel void kernel_gated_delta_net_r8_f32(
+        constant ggml_metal_kargs_gated_delta_net & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * g,
+        device const char * b,
+        device const char * s,
+        device       char * dst,
+        device       char * dst_fuse,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+    constexpr int D = 128;
+    constexpr int R = 8; // rows per simdgroup
+
+    const uint tx  = tpitg.x;                 // 0..31
+    const uint ty  = tpitg.y;                 // 0..1
+    const uint i23 = tgpig.z;                 // seq
+    const uint i21 = tgpig.y;                 // head
+    const uint r0  = (tgpig.x * 2 + ty) * R;  // 0, 8, 16, ..., 120
+
+    const uint i01 = i21 % args.ne01;
+    const uint i11 = i21 % args.ne11;
+    const float scale = 1.0f / sqrt((float)D);
+
+    const uint64_t head_state_base = ((uint64_t)i23 * args.ne21 + i21) * (uint64_t)(D * D);
+    device const float4 * s_in = (device const float4 *) ((device const float *) s + head_state_base + (uint64_t)r0 * D);
+
+    float4 ls[R];
+    FOR_UNROLL (int r = 0; r < R; ++r) {
+        ls[r] = s_in[r * 32 + tx];
+    }
+
+    device float * dst_attn = (device float *) dst + ((uint64_t)i23 * args.ne22 * args.ne21 + i21) * D + r0;
+
+    device const float * q_ptr = (device const float *) (q + (uint64_t)i23 * args.nb03 + (uint64_t)i01 * args.nb01);
+    device const float * k_ptr = (device const float *) (k + (uint64_t)i23 * args.nb13 + (uint64_t)i11 * args.nb11);
+    device const float * v_ptr = (device const float *) (v + (uint64_t)i23 * args.nb23 + (uint64_t)i21 * args.nb21);
+    device const float * b_ptr = (device const float *) b + ((uint64_t)i23 * args.ne22 * args.ne21 + i21);
+    device const float * g_ptr = (device const float *) g + ((uint64_t)i23 * args.ne22 * args.ne21 + i21);
+
+    const uint64_t attn_size = (uint64_t)args.ne22 * args.ne21 * D * args.ne23;
+    const bool fused = args.nb_out > 0;
+    device float * state_out = fused ? (device float *) dst_fuse : (device float *) dst + attn_size;
+
+    const int n_tokens = args.ne22;
+    const uint d = tx * 4;
+
+    for (int t = 0; t < n_tokens; ++t) {
+        const float g_exp = exp(g_ptr[0]);
+        const float beta  = b_ptr[0];
+        const float4 kv = float4(k_ptr[d + 0], k_ptr[d + 1], k_ptr[d + 2], k_ptr[d + 3]);
+        const float4 qv = float4(q_ptr[d + 0], q_ptr[d + 1], q_ptr[d + 2], q_ptr[d + 3]) * scale;
+
+        float y[R];
+        FOR_UNROLL (int r = 0; r < R; ++r) {
+            ls[r] *= g_exp;
+        }
+        float sk[R];
+        FOR_UNROLL (int r = 0; r < R; ++r) {
+            sk[r] = simd_sum(dot(ls[r], kv));
+        }
+        FOR_UNROLL (int r = 0; r < R; ++r) {
+            const float delta = (v_ptr[r0 + r] - sk[r]) * beta;
+            ls[r] = fma(kv, float4(delta), ls[r]);
+        }
+        FOR_UNROLL (int r = 0; r < R; ++r) {
+            y[r] = simd_sum(dot(ls[r], qv));
+        }
+
+        if (tx == 0) {
+            device float * out_t = dst_attn + (uint64_t)t * args.ne21 * D;
+            FOR_UNROLL (int r = 0; r < R; ++r) {
+                out_t[r] = y[r];
+            }
+        }
+
+        q_ptr += args.ns02;
+        k_ptr += args.ns12;
+        v_ptr += args.ns22;
+        b_ptr += args.ne21;
+        g_ptr += args.ne21;
+    }
+
+    device float4 * s_out = (device float4 *) (state_out + head_state_base + (uint64_t)r0 * D);
+    FOR_UNROLL (int r = 0; r < R; ++r) {
+        s_out[r * 32 + tx] = ls[r];
+    }
+}
+
 #else
 // a simplified version of the above
 // no performance improvement, so keep the above version for now

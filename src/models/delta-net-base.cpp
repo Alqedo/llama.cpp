@@ -58,20 +58,46 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         int64_t              conv_channels,
         int                  il) {
     const int64_t n_seqs = ubatch.n_seqs;
+    const int64_t n_cols = conv_kernel_size - 1;
+    const int64_t n_tok  = qkv_mixed->ne[1];
 
     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
     cb(conv_states, "conv_states", il);
 
-    conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
+    conv_states = ggml_reshape_3d(ctx0, conv_states, n_cols, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
-    qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
-    cb(qkv_mixed, "qkv_mixed_transposed", il);
+    ggml_tensor * qkv_t = ggml_transpose(ctx0, qkv_mixed);
+    cb(qkv_t, "qkv_mixed_transposed", il);
 
-    ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
+    ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_t, 0);
     cb(conv_input, "conv_input", il);
 
-    build_conv_state_store(inp, conv_states_all, conv_input, conv_kernel_size - 1, 0);
+    if (cparams.n_rs_seq == 0 && n_tok >= n_cols) {
+        // Copy the tail of qkv_mixed directly into conv_states_all so conv_input has a single
+        // consumer (ggml_ssm_conv), allowing Metal to fuse CONCAT + SSM_CONV + SILU in place.
+        const auto * mctx_cur  = inp->mctx;
+        const size_t row_size  = conv_states_all->nb[1];
+        const size_t cell_offs = mctx_cur->get_head() * row_size;
+
+        ggml_tensor * tail_qkv = ggml_view_3d(ctx0, qkv_mixed,
+                conv_channels, n_cols, n_seqs,
+                qkv_mixed->nb[1], qkv_mixed->nb[2],
+                (size_t)(n_tok - n_cols) * qkv_mixed->nb[1]);
+        // Pin an explicit data dependency on `conv_states` (the `build_rs` gather) so no backend
+        // scheduler can ever reorder this cache overwrite ahead of the conv-state read.
+        // Add before transposing so `tail_qkv` keeps `nb[0] == sizeof(float)` on every backend.
+        ggml_tensor * pin  = ggml_clamp(ctx0, ggml_view_1d(ctx0, conv_states, 1, 0), 0.0f, 0.0f);
+        ggml_tensor * tied = ggml_add(ctx0, tail_qkv, pin);
+        ggml_tensor * last = ggml_transpose(ctx0, tied);
+        ggml_tensor * cell = ggml_view_2d(ctx0, conv_states_all,
+                n_cols * conv_channels, n_seqs,
+                row_size, cell_offs);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, last, cell));
+    } else {
+        build_conv_state_store(inp, conv_states_all, conv_input, n_cols, 0);
+    }
 
     return conv_input;
 }
