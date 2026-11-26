@@ -616,6 +616,18 @@ class ModernBertModel(BertModel):
         self.gguf_writer.add_add_eos_token(True)
         self.gguf_writer.add_add_sep_token(True)
         self._set_vocab_gpt2()
+        pre = self.gguf_writer.kv_data[0].get(gguf.Keys.Tokenizer.PRE)
+        scheme = self.gguf_writer.kv_data[0].get(gguf.Keys.Tokenizer.METASPACE_PREPEND_SCHEME)
+        if (
+            pre is not None
+            and pre.value == "mmbert"
+            and scheme is not None
+            and scheme.value == "always"
+        ):
+            # LLAMA_VOCAB_PRE_TYPE_MMBERT already applies Metaspace prepend_scheme="always"
+            # in llama.cpp both before and after commit 532d6742; emitting the KV key breaks
+            # pre-532d6742 BPE loaders that explicitly reject prepend_scheme="always".
+            del self.gguf_writer.kv_data[0][gguf.Keys.Tokenizer.METASPACE_PREPEND_SCHEME]
 
     def get_vocab_base(self) -> tuple[list[str], list[int], str]:
         tokens, toktypes, tokpre = super().get_vocab_base()
