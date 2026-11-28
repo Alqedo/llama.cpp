@@ -148,14 +148,17 @@ llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
     return nullptr;
 }
 
-static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama_adapter_lora & adapter) {
+static void llama_adapter_lora_init_impl(
+        llama_model & model, FILE * file, const llama_gguf_source * source, llama_adapter_lora & adapter) {
     ggml_context * ctx_init;
     gguf_init_params meta_gguf_params = {
         /* .no_alloc = */ true,
         /* .ctx      = */ &ctx_init,
     };
 
-    gguf_context_ptr ctx_gguf { gguf_init_from_file_ptr(file, meta_gguf_params) };
+    gguf_context_ptr ctx_gguf { source
+        ? gguf_init_from_callback(source->read_at, source->userdata, 0, source->size, meta_gguf_params)
+        : gguf_init_from_file_ptr(file, meta_gguf_params) };
     if (!ctx_gguf) {
         throw std::runtime_error("failed to load lora adapter from file");
     }
@@ -163,7 +166,7 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
     ggml_context_ptr ctx { ctx_init };
 
     // must come after gguf_init_from_file_ptr, the llama_file constructor moves the file position
-    llama_file gguf_file(file);
+    llama_file gguf_file = source ? llama_file(*source) : llama_file(file);
 
     // check metadata
     {
@@ -451,7 +454,7 @@ llama_adapter_lora * llama_adapter_lora_init_from_file_ptr(llama_model * model, 
     llama_adapter_lora * adapter = new llama_adapter_lora(model);
 
     try {
-        llama_adapter_lora_init_impl(*model, file, *adapter);
+        llama_adapter_lora_init_impl(*model, file, nullptr, *adapter);
         return adapter;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to apply lora adapter: %s\n", __func__, err.what());
@@ -460,6 +463,20 @@ llama_adapter_lora * llama_adapter_lora_init_from_file_ptr(llama_model * model, 
     }
 
     return nullptr;
+}
+
+llama_adapter_lora * llama_adapter_lora_init_from_reader(llama_model * model, llama_gguf_source source) {
+    if (!source.read_at || source.size > SIZE_MAX || source.tensor_file) {
+        return nullptr;
+    }
+    std::unique_ptr<llama_adapter_lora> adapter(new llama_adapter_lora(model));
+    try {
+        llama_adapter_lora_init_impl(*model, nullptr, &source, *adapter);
+        return adapter.release();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: failed to apply lora adapter: %s\n", __func__, err.what());
+        return nullptr;
+    }
 }
 
 int32_t llama_adapter_meta_val_str(const llama_adapter_lora * adapter, const char * key, char * buf, size_t buf_size) {

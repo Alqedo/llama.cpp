@@ -644,15 +644,24 @@ llama_file::llama_file(const char * fname, const char * mode, const bool use_dir
 
 llama_file::llama_file(FILE * file) : pimpl(std::make_unique<impl>(file)) {}
 
+llama_file::llama_file(llama_gguf_source source) : source(source), source_size(source.size) {
+    if (!source.read_at || source.size > SIZE_MAX) {
+        throw std::runtime_error("invalid GGUF reader");
+    }
+}
+
 llama_file::~llama_file() = default;
 
-size_t llama_file::tell() const { return pimpl->tell(); }
-size_t llama_file::size() const { return pimpl->size; }
+size_t llama_file::tell() const { return pimpl ? pimpl->tell() : source_offset; }
+size_t llama_file::size() const { return pimpl ? pimpl->size : source_size; }
 
-size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
-bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
+size_t llama_file::read_alignment() const { return pimpl ? pimpl->read_alignment() : 1; }
+bool llama_file::has_direct_io() const { return pimpl && pimpl->has_direct_io(); }
 
 int llama_file::file_id() const {
+    if (!pimpl) {
+        return -1;
+    }
 #ifdef _WIN32
     return _fileno(pimpl->fp);
 #else
@@ -667,14 +676,51 @@ int llama_file::file_id() const {
 #endif
 }
 
-void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
-void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
-void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
+void llama_file::seek(size_t offset, int whence) const {
+    if (pimpl) {
+        pimpl->seek(offset, whence);
+        return;
+    }
+    if (whence != SEEK_SET || offset > source_size) {
+        throw std::runtime_error("invalid seek on GGUF reader");
+    }
+    source_offset = offset;
+}
 
-uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
+void llama_file::read_raw(void * ptr, size_t len) {
+    if (pimpl) {
+        pimpl->read_raw(ptr, len);
+        return;
+    }
+    if (len > source_size - source_offset ||
+            (len && source.read_at(source.userdata, ptr, source_offset, len) != len)) {
+        throw std::runtime_error("failed to read GGUF data from reader");
+    }
+    source_offset += len;
+}
 
-void llama_file::write_raw(const void * ptr, size_t len) const { pimpl->write_raw(ptr, len); }
-void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
+void llama_file::read_raw_unsafe(void * ptr, size_t len) {
+    if (pimpl) {
+        pimpl->read_raw_unsafe(ptr, len);
+    } else {
+        read_raw(ptr, len);
+    }
+}
+
+uint32_t llama_file::read_u32() {
+    uint32_t result;
+    read_raw(&result, sizeof(result));
+    return result;
+}
+
+void llama_file::write_raw(const void * ptr, size_t len) const {
+    if (!pimpl) {
+        throw std::runtime_error("GGUF reader is read-only");
+    }
+    pimpl->write_raw(ptr, len);
+}
+
+void llama_file::write_u32(uint32_t val) const { write_raw(&val, sizeof(val)); }
 
 // llama_mmap
 

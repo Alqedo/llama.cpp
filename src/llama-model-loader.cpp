@@ -546,7 +546,8 @@ llama_model_loader::llama_model_loader(
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        const llama_gguf_source * source)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
@@ -759,30 +760,36 @@ llama_model_loader::llama_model_loader(
         if (files.size() > 1) {
             LLAMA_LOG_INFO("%s: additional %zu GGUFs metadata loaded.\n", __func__, files.size() - 1);
         }
-    } else if (file != nullptr) {
+    } else if (file != nullptr || source != nullptr) {
         struct ggml_context * ctx = NULL;
         struct gguf_init_params params = {
             /*.no_alloc = */ true,
             /*.ctx      = */ &ctx,
         };
 
-        metadata_ptr.reset(gguf_init_from_file_ptr(file, params));
+        metadata_ptr.reset(source
+            ? gguf_init_from_callback(source->read_at, source->userdata, 0, source->size, params)
+            : gguf_init_from_file_ptr(file, params));
         metadata = metadata_ptr.get();
         if (metadata == nullptr) {
             throw std::runtime_error(format("%s: failed to load model from file pointer", __func__));
         }
 
+        FILE * tensor_file = source ? source->tensor_file : file;
+        const size_t data_offset = source && tensor_file
+            ? static_cast<size_t>(source->tensor_file_offset)
+            : gguf_get_data_offset(metadata);
         // mmap places tensors at their file offsets, so an embedded GGUF must be aligned in the file too
         const size_t tensor_align = ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
-        if (use_mmap && gguf_get_data_offset(metadata) % tensor_align != 0) {
+        if (use_mmap && data_offset % tensor_align != 0) {
             throw std::runtime_error(format("%s: GGUF data section at file offset %zu is not %zu byte aligned, cannot mmap",
-                __func__, gguf_get_data_offset(metadata), tensor_align));
+                __func__, data_offset, tensor_align));
         }
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
-        files.emplace_back(new llama_file(file));
+        files.emplace_back(tensor_file ? new llama_file(tensor_file) : new llama_file(*source));
         contexts.emplace_back(ctx);
 
         // Save tensors data offset info of the main file.
@@ -794,7 +801,7 @@ llama_model_loader::llama_model_loader(
             }
             n_elements += ggml_nelements(cur);
             n_bytes    += ggml_nbytes(cur);
-            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
+            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur, data_offset));
         }
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);

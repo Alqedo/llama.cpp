@@ -539,6 +539,21 @@ extern "C" {
                                    FILE * file,
               struct llama_model_params   params);
 
+    // Seekable, single-file GGUF source. Return the number of bytes read at offset.
+    // The source is used synchronously and does not need to outlive the load.
+    typedef size_t (*llama_gguf_read_at_t)(void * userdata, void * output, uint64_t offset, size_t len);
+    struct llama_gguf_source {
+        llama_gguf_read_at_t read_at;
+        void * userdata;
+        uint64_t size;
+        // Optional, borrowed file with contiguous tensor data. The reader still supplies metadata.
+        FILE * tensor_file;
+        uint64_t tensor_file_offset;
+    };
+
+    LLAMA_API struct llama_model * llama_model_load_from_reader(
+            struct llama_gguf_source source, struct llama_model_params params);
+
     // Load a model from multiple splits (support custom naming scheme)
     // The paths must be in the correct order
     LLAMA_API struct llama_model * llama_model_load_from_splits(
@@ -714,6 +729,10 @@ extern "C" {
     LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init_from_file_ptr(
             struct llama_model * model,
             FILE * file);
+
+    // Load a LoRA adapter from a seekable GGUF source.
+    LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init_from_reader(
+            struct llama_model * model, struct llama_gguf_source source);
 
     // Functions to access the adapter's GGUF metadata scalar values
     // - The functions return the length of the string on success, or -1 on failure

@@ -6,6 +6,8 @@
 #include <vector>
 #include <cstdio>
 
+#include "llama.h"
+
 // staging buffer size for direct I/O reads, 64MB works well for NVMe drives
 #define LLAMA_DIRECT_IO_BUFFER_SIZE (64 * 1024 * 1024)
 
@@ -20,6 +22,7 @@ using llama_mlocks = std::vector<std::unique_ptr<llama_mlock>>;
 struct llama_file {
     llama_file(const char * fname, const char * mode, bool use_direct_io = false);
     llama_file(FILE * file);
+    llama_file(llama_gguf_source source);
     ~llama_file();
 
     size_t tell() const;
@@ -42,6 +45,9 @@ struct llama_file {
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
+    llama_gguf_source source = {};
+    size_t source_size = 0;
+    mutable size_t source_offset = 0;
 };
 
 struct llama_mmap {
